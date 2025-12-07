@@ -331,81 +331,92 @@ configure_ip_access_control() {
         fi
     }
     
-    # 下载并处理黑名单
-    download_blacklist() {
-        BLACKLIST_URL="https://blackip.ustc.edu.cn/list.php?txt"
-        BLACKLIST_FILE="/tmp/blacklist.txt"
+    # 下载并处理IP列表
+    download_ip_list() {
+        local list_type="$1"
+        local output_file="$2"
+        local url=""
         
-        log "下载黑名单IP列表..." "INFO"
-        wget -q -O "$BLACKLIST_FILE" "$BLACKLIST_URL" || error_handler "下载黑名单失败"
+        if [ "$list_type" = "blacklist" ]; then
+            url="https://blackip.ustc.edu.cn/list.php?txt"
+            log "下载黑名单IP列表..." "INFO"
+        elif [ "$list_type" = "nonchina" ]; then
+            url="https://raw.githubusercontent.com/houoop/not-china-ip-list/main/nonchina_ip_list.txt"
+            log "下载非中国IP列表..." "INFO"
+        else
+            error_handler "无效的列表类型"
+        fi
+        
+        wget -q -O "$output_file" "$url" || error_handler "下载IP列表失败"
         
         # 过滤有效IP地址
-        grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' "$BLACKLIST_FILE" > "$BLACKLIST_FILE.filtered"
-        log "已过滤黑名单IP，有效IP数量：$(wc -l < "$BLACKLIST_FILE.filtered")" "INFO"
+        grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' "$output_file" > "$output_file.filtered"
+        log "已过滤IP列表，有效IP数量：$(wc -l < "$output_file.filtered")" "INFO"
     }
     
     # 配置ipset
     configure_ipset() {
-        IPSET_NAME="blacklist"
+        local ipset_name="$1"
+        local input_file="$2"
         
         # 创建ipset
-        ipset create "$IPSET_NAME" hash:net family inet hashsize 1024 maxelem 65536 2>/dev/null || true
+        ipset create "$ipset_name" hash:net family inet hashsize 1024 maxelem 65536 2>/dev/null || true
         
         # 清空现有ipset
-        ipset flush "$IPSET_NAME"
+        ipset flush "$ipset_name"
         
         # 添加IP到ipset
         while read -r ip; do
-            ipset add "$IPSET_NAME" "$ip" 2>/dev/null || true
-        done < "$BLACKLIST_FILE.filtered"
+            ipset add "$ipset_name" "$ip" 2>/dev/null || true
+        done < "$input_file.filtered"
         
-        log "已添加$(ipset list "$IPSET_NAME" | grep -c '^[0-9]')个IP到黑名单" "INFO"
+        log "已添加$(ipset list "$ipset_name" | grep -c '^[0-9]')个IP到$ipset_name" "INFO"
     }
     
     # 使用firewalld配置
     configure_firewalld() {
-        IPSET_NAME="blacklist"
+        local ipset_name="$1"
         
         # 检查ipset是否存在于firewalld
-        if ! firewall-cmd --get-ipsets | grep -q "$IPSET_NAME"; then
-            firewall-cmd --permanent --new-ipset="$IPSET_NAME" --type=hash:net --option=family=inet --option=hashsize=1024 --option=maxelem=65536 || error_handler "创建firewalld ipset失败"
+        if ! firewall-cmd --get-ipsets | grep -q "$ipset_name"; then
+            firewall-cmd --permanent --new-ipset="$ipset_name" --type=hash:net --option=family=inet --option=hashsize=1024 --option=maxelem=65536 || error_handler "创建firewalld ipset失败"
         fi
         
         # 重载firewalld以加载新ipset
         firewall-cmd --reload || error_handler "重载firewalld失败"
         
         # 添加规则
-        firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source ipset=\"$IPSET_NAME\" reject" || error_handler "添加firewalld规则失败"
+        firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source ipset=\"$ipset_name\" reject" || error_handler "添加firewalld规则失败"
         firewall-cmd --reload || error_handler "重载firewalld失败"
         
-        log "firewalld已配置黑名单IP拦截" "INFO"
+        log "firewalld已配置$ipset_name IP拦截" "INFO"
     }
     
     # 使用ufw配置
     configure_ufw() {
-        IPSET_NAME="blacklist"
+        local ipset_name="$1"
         
         # 创建ufw规则文件（如果不存在）
         UFW_RULE_FILE="/etc/ufw/before.rules"
         
         # 检查规则是否已存在
-        if ! grep -q "ipset match $IPSET_NAME" "$UFW_RULE_FILE"; then
+        if ! grep -q "ipset match $ipset_name" "$UFW_RULE_FILE"; then
             # 在文件开头添加规则
             sed -i '1i *filter\n:ufw-before-input - [0:0]\n:ufw-before-output - [0:0]\n:ufw-before-forward - [0:0]\n:ufw-not-local - [0:0]\n' "$UFW_RULE_FILE" 2>/dev/null || true
             # 添加ipset规则
-            sed -i '/:ufw-before-input - \[0:0\]/a -A ufw-before-input -m set --match-set '$IPSET_NAME' src -j DROP' "$UFW_RULE_FILE"
+            sed -i '/:ufw-before-input - \[0:0\]/a -A ufw-before-input -m set --match-set '$ipset_name' src -j DROP' "$UFW_RULE_FILE"
         fi
         
         ufw reload || error_handler "重载ufw失败"
-        log "ufw已配置黑名单IP拦截" "INFO"
+        log "ufw已配置$ipset_name IP拦截" "INFO"
     }
     
     # 使用iptables配置
     configure_iptables() {
-        IPSET_NAME="blacklist"
+        local ipset_name="$1"
         
         # 添加iptables规则
-        iptables -I INPUT -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null || true
+        iptables -I INPUT -m set --match-set "$ipset_name" src -j DROP 2>/dev/null || true
         
         # 保存规则
         if [ "$OS" = "debian" ]; then
@@ -414,11 +425,25 @@ configure_ip_access_control() {
             iptables-save > /etc/sysconfig/iptables || error_handler "保存iptables规则失败"
         fi
         
-        log "iptables已配置黑名单IP拦截" "INFO"
+        log "iptables已配置$ipset_name IP拦截" "INFO"
     }
     
     # 启用IP访问控制
     enable_ip_access_control() {
+        local list_type="$1"
+        local ipset_name=""
+        local output_file=""
+        
+        if [ "$list_type" = "blacklist" ]; then
+            ipset_name="blacklist"
+            output_file="/tmp/blacklist.txt"
+        elif [ "$list_type" = "nonchina" ]; then
+            ipset_name="nonchina"
+            output_file="/tmp/nonchina.txt"
+        else
+            error_handler "无效的列表类型"
+        fi
+        
         log "启用IP访问控制..." "INFO"
         
         # 检测并安装防火墙
@@ -427,47 +452,61 @@ configure_ip_access_control() {
         # 安装wget
         install_wget
         
-        # 下载黑名单
-        download_blacklist
+        # 下载IP列表
+        download_ip_list "$list_type" "$output_file"
         
         # 配置ipset
-        configure_ipset
+        configure_ipset "$ipset_name" "$output_file"
         
         # 根据防火墙类型配置规则
         case "$FIREWALL_TYPE" in
             "firewalld")
-                configure_firewalld
+                configure_firewalld "$ipset_name"
                 ;;
             "ufw")
-                configure_ufw
+                configure_ufw "$ipset_name"
                 ;;
             *)
-                configure_iptables
+                configure_iptables "$ipset_name"
                 ;;
         esac
         
-        log "${GREEN}IP访问控制已启用，黑名单已加载${NC}" "INFO"
+        log "${GREEN}IP访问控制已启用，$list_type列表已加载${NC}" "INFO"
     }
     
     # 禁用IP访问控制
     disable_ip_access_control() {
-        log "禁用IP访问控制..." "INFO"
+        local list_type="$1"
+        local ipset_name=""
         
-        IPSET_NAME="blacklist"
+        if [ "$list_type" = "blacklist" ]; then
+            ipset_name="blacklist"
+        elif [ "$list_type" = "nonchina" ]; then
+            ipset_name="nonchina"
+        elif [ "$list_type" = "all" ]; then
+            # 禁用所有类型的IP访问控制
+            disable_ip_access_control "blacklist"
+            disable_ip_access_control "nonchina"
+            return 0
+        else
+            error_handler "无效的列表类型"
+        fi
+        
+        log "禁用IP访问控制..." "INFO"
         
         # 根据防火墙类型移除规则
         case "$FIREWALL_TYPE" in
             "firewalld")
-                firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" source ipset=\"$IPSET_NAME\" reject" || true
+                firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" source ipset=\"$ipset_name\" reject" || true
                 firewall-cmd --reload || true
                 ;;
             "ufw")
                 UFW_RULE_FILE="/etc/ufw/before.rules"
-                sed -i '/-A ufw-before-input -m set --match-set '$IPSET_NAME' src -j DROP/d' "$UFW_RULE_FILE" || true
+                sed -i '/-A ufw-before-input -m set --match-set '$ipset_name' src -j DROP/d' "$UFW_RULE_FILE" || true
                 ufw reload || true
                 ;;
             *)
-                iptables -D INPUT -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null || true
+                iptables -D INPUT -m set --match-set "$ipset_name" src -j DROP 2>/dev/null || true
                 if [ "$OS" = "debian" ]; then
                     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
                 else
@@ -477,32 +516,54 @@ configure_ip_access_control() {
         esac
         
         # 清空并删除ipset
-        ipset flush "$IPSET_NAME" 2>/dev/null || true
-        ipset destroy "$IPSET_NAME" 2>/dev/null || true
+        ipset flush "$ipset_name" 2>/dev/null || true
+        ipset destroy "$ipset_name" 2>/dev/null || true
         
-        log "${GREEN}IP访问控制已禁用，黑名单已移除${NC}" "INFO"
+        log "${GREEN}IP访问控制已禁用，$list_type列表已移除${NC}" "INFO"
     }
     
     # 主菜单
     echo -e "${YELLOW}1. 启用IP访问控制（屏蔽黑名单IP）${NC}"
-    echo -e "${YELLOW}2. 禁用IP访问控制${NC}"
-    echo -e "${YELLOW}3. 查看当前配置${NC}"
+    echo -e "${YELLOW}2. 启用海外IP屏蔽（仅允许中国IP访问）${NC}"
+    echo -e "${YELLOW}3. 禁用黑名单IP屏蔽${NC}"
+    echo -e "${YELLOW}4. 禁用海外IP屏蔽${NC}"
+    echo -e "${YELLOW}5. 禁用所有IP访问控制${NC}"
+    echo -e "${YELLOW}6. 查看当前配置${NC}"
+    echo -e "${YELLOW}7. 返回主菜单${NC}"
     read -p "${YELLOW}请选择: ${NC}" ip_choice
     
     case $ip_choice in
         1)
             if confirm "确定要启用IP访问控制吗？这将屏蔽黑名单IP。"; then
                 detect_firewall
-                enable_ip_access_control
+                enable_ip_access_control "blacklist"
             fi
             ;;
         2)
-            if confirm "确定要禁用IP访问控制吗？"; then
+            if confirm "确定要启用海外IP屏蔽吗？这将仅允许中国IP访问。"; then
                 detect_firewall
-                disable_ip_access_control
+                enable_ip_access_control "nonchina"
             fi
             ;;
         3)
+            if confirm "确定要禁用黑名单IP屏蔽吗？"; then
+                detect_firewall
+                disable_ip_access_control "blacklist"
+            fi
+            ;;
+        4)
+            if confirm "确定要禁用海外IP屏蔽吗？"; then
+                detect_firewall
+                disable_ip_access_control "nonchina"
+            fi
+            ;;
+        5)
+            if confirm "确定要禁用所有IP访问控制吗？"; then
+                detect_firewall
+                disable_ip_access_control "all"
+            fi
+            ;;
+        6)
             detect_firewall
             log "当前防火墙类型：$FIREWALL_TYPE" "INFO"
             if ipset list blacklist 2>/dev/null; then
@@ -510,6 +571,14 @@ configure_ip_access_control() {
             else
                 log "未配置黑名单" "INFO"
             fi
+            if ipset list nonchina 2>/dev/null; then
+                log "非中国IP数量：$(ipset list nonchina | grep -c '^[0-9]')" "INFO"
+            else
+                log "未配置海外IP屏蔽" "INFO"
+            fi
+            ;;
+        7)
+            return 0
             ;;
         *)
             log "无效选择" "INFO"
